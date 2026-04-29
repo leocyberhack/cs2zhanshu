@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+tactics.db
+*.sqlite
+*.sqlite3
+
+server.out.log
+server.err.log
+*.log
+
+.DS_Store
+Thumbs.db

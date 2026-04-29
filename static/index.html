@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CS2 战术本</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div>
+            <h1>CS2 战术本</h1>
+            <p>Python · SQLite</p>
+          </div>
+        </div>
+
+        <div class="map-actions">
+          <button class="btn primary" type="button" data-action="open-map-modal" data-mode="create">新增地图</button>
+        </div>
+
+        <div id="mapList" class="map-list" aria-label="地图池"></div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">当前地图</p>
+            <h2 id="currentMapName">未选择</h2>
+          </div>
+          <div class="topbar-actions">
+            <button class="btn ghost" type="button" data-action="open-map-modal" data-mode="edit">重命名</button>
+            <button class="btn danger" type="button" data-action="delete-map">删除地图</button>
+          </div>
+        </header>
+
+        <nav id="tabs" class="tabs" aria-label="战术分区"></nav>
+        <section id="content" class="content"></section>
+      </main>
+    </div>
+
+    <div id="mapModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="mapModalTitle">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <h3 id="mapModalTitle">新增地图</h3>
+          <button class="icon-btn" type="button" data-action="close-map-modal" aria-label="关闭">×</button>
+        </div>
+        <label class="field">
+          <span>地图名称</span>
+          <input id="mapNameInput" type="text" maxlength="60" autocomplete="off" />
+        </label>
+        <div class="modal-actions">
+          <button class="btn ghost" type="button" data-action="close-map-modal">取消</button>
+          <button class="btn primary" type="button" data-action="save-map">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </body>
+</html>

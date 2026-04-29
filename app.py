@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -15,6 +20,9 @@ from urllib.parse import unquote, urlparse
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DB_PATH = Path(os.environ.get("DB_PATH", str(BASE_DIR / "tactics.db"))).resolve()
+ACCESS_KEY_ENV = "APP_ACCESS_KEY"
+AUTH_COOKIE = "cs2_tactics_session"
+SESSION_MAX_AGE = 30 * 24 * 60 * 60
 
 DEFAULT_MAPS = ["Mirage", "Dust2", "Ancient", "Nuke", "Overpass", "Anubis"]
 SIDES = {"T", "CT"}
@@ -24,6 +32,48 @@ TACTIC_TAG_OPTIONS = {"常规默认", "非常规", "爆弹", "rush", "自定义"
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_access_key() -> str:
+    value = os.environ.get(ACCESS_KEY_ENV, "").strip()
+    if value:
+        return value
+    if not os.environ.get("PORT"):
+        return "local-dev-key"
+    return ""
+
+
+def auth_configured() -> bool:
+    return bool(get_access_key())
+
+
+def sign_session(timestamp: str, nonce: str) -> str:
+    secret = get_access_key().encode("utf-8")
+    message = f"{timestamp}:{nonce}".encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def make_session_token() -> str:
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(18)
+    signature = sign_session(timestamp, nonce)
+    raw = f"{timestamp}:{nonce}:{signature}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def verify_session_token(token: str) -> bool:
+    if not auth_configured() or not token:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        timestamp, nonce, signature = raw.split(":", 2)
+        created_at = int(timestamp)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if int(time.time()) - created_at > SESSION_MAX_AGE:
+        return False
+    expected = sign_session(timestamp, nonce)
+    return hmac.compare_digest(signature, expected)
 
 
 def connect() -> sqlite3.Connection:
@@ -336,6 +386,33 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "请求体必须是对象")
         return value
 
+    def cookie_value(self, name: str) -> str:
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return ""
+        cookies = SimpleCookie()
+        try:
+            cookies.load(cookie_header)
+        except Exception:
+            return ""
+        morsel = cookies.get(name)
+        return morsel.value if morsel else ""
+
+    def is_authenticated(self) -> bool:
+        return verify_session_token(self.cookie_value(AUTH_COOKIE))
+
+    def send_auth_cookie(self, token: str) -> None:
+        self.send_header(
+            "Set-Cookie",
+            f"{AUTH_COOKIE}={token}; Max-Age={SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax",
+        )
+
+    def clear_auth_cookie(self) -> None:
+        self.send_header(
+            "Set-Cookie",
+            f"{AUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
+        )
+
     def send_json(self, value, status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -373,6 +450,47 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and parts == ["api", "health"]:
             self.send_json({"ok": True})
             return
+
+        if method == "GET" and parts == ["api", "auth"]:
+            self.send_json(
+                {
+                    "authenticated": self.is_authenticated(),
+                    "configured": auth_configured(),
+                    "env": ACCESS_KEY_ENV,
+                }
+            )
+            return
+
+        if method == "POST" and parts == ["api", "login"]:
+            data = self.read_json()
+            access_key = get_access_key()
+            if not access_key:
+                raise ApiError(503, f"服务器未配置 {ACCESS_KEY_ENV}")
+            candidate = str(data.get("key", "")).strip()
+            if not candidate or not hmac.compare_digest(candidate, access_key):
+                raise ApiError(401, "密钥不正确")
+            token = make_session_token()
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_auth_cookie(token)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if method == "POST" and parts == ["api", "logout"]:
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.clear_auth_cookie()
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if not self.is_authenticated():
+            raise ApiError(401, "请先输入密钥登录")
 
         if method == "GET" and parts == ["api", "maps"]:
             with connect() as conn:
@@ -580,6 +698,8 @@ def run() -> None:
     server = ThreadingHTTPServer((host, port), Handler)
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"CS2 战术本已启动: http://{display_host}:{port}", flush=True)
+    if not os.environ.get(ACCESS_KEY_ENV) and not env_port:
+        print(f"本地测试密钥: {get_access_key()}", flush=True)
     print("按 Ctrl+C 停止服务", flush=True)
     server.serve_forever()
 

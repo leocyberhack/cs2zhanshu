@@ -8,7 +8,29 @@
     <script defer src="/static/app.js"></script>
   </head>
   <body>
-    <div class="app-shell">
+    <section id="authGate" class="auth-gate">
+      <form id="loginForm" class="auth-panel">
+        <div class="brand auth-brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div>
+            <h1>CS2 战术本</h1>
+            <p>输入密钥后继续</p>
+          </div>
+        </div>
+        <label class="field">
+          <span>访问密钥</span>
+          <input id="accessKeyInput" type="password" autocomplete="current-password" autofocus />
+        </label>
+        <button class="btn primary" type="submit">登录</button>
+        <p id="loginHint" class="login-hint"></p>
+      </form>
+    </section>
+
+    <div id="appShell" class="app-shell hidden">
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">
@@ -36,6 +58,7 @@
             <h2 id="currentMapName">未选择</h2>
           </div>
           <div class="topbar-actions">
+            <button class="btn ghost" type="button" data-action="logout">退出登录</button>
             <button class="btn ghost" type="button" data-action="open-map-modal" data-mode="edit">重命名</button>
             <button class="btn danger" type="button" data-action="delete-map">删除地图</button>
           </div>

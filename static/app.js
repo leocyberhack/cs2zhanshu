@@ -91,6 +91,7 @@ function emptyTactic(side) {
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {}),
@@ -99,6 +100,9 @@ async function api(path, options = {}) {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
+    if (response.status === 401 && path !== "/api/login") {
+      showLogin(data.error || "请先输入密钥登录");
+    }
     throw new Error(data.error || "请求失败");
   }
   return data;
@@ -122,6 +126,62 @@ function currentTab() {
 
 function sameId(left, right) {
   return String(left) === String(right);
+}
+
+function setLoginHint(message = "") {
+  const hint = $("#loginHint");
+  if (hint) hint.textContent = message;
+}
+
+function showLogin(message = "") {
+  $("#appShell")?.classList.add("hidden");
+  $("#authGate")?.classList.remove("hidden");
+  setLoginHint(message);
+  window.setTimeout(() => $("#accessKeyInput")?.focus(), 0);
+}
+
+function showApp() {
+  $("#authGate")?.classList.add("hidden");
+  $("#appShell")?.classList.remove("hidden");
+  setLoginHint("");
+}
+
+async function checkAuth() {
+  const data = await api("/api/auth");
+  if (data.authenticated) {
+    showApp();
+    await loadMaps();
+    return;
+  }
+  const message = data.configured ? "" : `服务器未配置 ${data.env}`;
+  showLogin(message);
+}
+
+async function loginWithKey() {
+  const input = $("#accessKeyInput");
+  const key = input?.value.trim() || "";
+  if (!key) {
+    setLoginHint("请输入访问密钥");
+    input?.focus();
+    return;
+  }
+  await api("/api/login", {
+    method: "POST",
+    body: JSON.stringify({ key }),
+  });
+  if (input) input.value = "";
+  showApp();
+  await loadMaps();
+}
+
+async function logout() {
+  await api("/api/logout", { method: "POST" });
+  state.maps = [];
+  state.selectedMapId = null;
+  state.content = null;
+  state.selectedTacticIds = { T: null, CT: null };
+  state.tacticDrafts = { T: null, CT: null };
+  showLogin("已退出登录");
 }
 
 async function loadMaps(preferredId = state.selectedMapId) {
@@ -712,6 +772,11 @@ document.addEventListener("click", async (event) => {
   if (!target) return;
   const action = target.dataset.action;
   try {
+    if (action === "logout") {
+      await logout();
+      return;
+    }
+
     if (action === "select-map") {
       hydrateCurrentTacticFromForm();
       state.selectedMapId = Number(target.dataset.id);
@@ -823,6 +888,16 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+$("#loginForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    setLoginHint("");
+    await loginWithKey();
+  } catch (error) {
+    setLoginHint(error.message);
+  }
+});
+
 document.addEventListener("input", (event) => {
   const target = event.target;
   if (target.matches("[data-decision-field]")) {
@@ -853,4 +928,4 @@ document.addEventListener("keydown", async (event) => {
   }
 });
 
-loadMaps().catch((error) => toast(error.message, "error"));
+checkAuth().catch((error) => showLogin(error.message));

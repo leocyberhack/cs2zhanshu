@@ -36,6 +36,8 @@ MAX_JSON_BODY_SIZE = 2 * 1024 * 1024
 GZIP_MIN_BODY_SIZE = 1024
 KEEP_ALIVE_TIMEOUT = 15
 VERSIONED_ASSETS = ("styles.css", "app.js")
+EXPORT_JOB_TTL = 15 * 60
+EXPORT_JOB_LIMIT = 16
 
 DEFAULT_MAPS = ["Mirage", "Dust2", "Ancient", "Nuke", "Overpass", "Anubis"]
 SIDES = {"T", "CT"}
@@ -621,6 +623,133 @@ def _wrap_text_for_pdf(c, font_name: str, size: int, text: str, max_width: float
     return lines
 
 
+_export_jobs_lock = threading.Lock()
+_export_jobs: dict[str, dict] = {}
+
+
+def validate_export_format(value: str) -> str:
+    export_format = str(value or "docx").strip().lower()
+    if export_format not in {"docx", "pdf"}:
+        raise ApiError(400, "导出格式必须是 docx 或 pdf")
+    return export_format
+
+
+def export_filename(export_format: str) -> str:
+    return "cs2-tactics-book.pdf" if export_format == "pdf" else "cs2-tactics-book.docx"
+
+
+def export_content_type(export_format: str) -> str:
+    if export_format == "pdf":
+        return "application/pdf"
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def build_export_file(export_format: str) -> bytes:
+    blocks = build_export_blocks()
+    if export_format == "docx":
+        return build_docx(blocks)
+    if export_format == "pdf":
+        return build_pdf(blocks)
+    raise ApiError(400, "导出格式必须是 docx 或 pdf")
+
+
+def cleanup_export_jobs() -> None:
+    cutoff = time.time() - EXPORT_JOB_TTL
+    stale_ids = [
+        job_id
+        for job_id, job in _export_jobs.items()
+        if (job.get("finished_ts") or job.get("created_ts", 0)) < cutoff
+    ]
+    for job_id in stale_ids:
+        _export_jobs.pop(job_id, None)
+
+    if len(_export_jobs) <= EXPORT_JOB_LIMIT:
+        return
+    ordered = sorted(_export_jobs.items(), key=lambda item: item[1].get("created_ts", 0))
+    for job_id, _job in ordered[: len(_export_jobs) - EXPORT_JOB_LIMIT]:
+        _export_jobs.pop(job_id, None)
+
+
+def export_job_public(job: dict) -> dict:
+    return {
+        "id": job["id"],
+        "format": job["format"],
+        "status": job["status"],
+        "filename": job["filename"],
+        "size": job.get("size", 0),
+        "error": job.get("error", ""),
+        "created_at": job["created_at"],
+        "started_at": job.get("started_at", ""),
+        "finished_at": job.get("finished_at", ""),
+    }
+
+
+def start_export_job(export_format: str) -> dict:
+    job_id = secrets.token_urlsafe(12)
+    stamp = now()
+    job = {
+        "id": job_id,
+        "format": export_format,
+        "status": "queued",
+        "filename": export_filename(export_format),
+        "content_type": export_content_type(export_format),
+        "content": b"",
+        "size": 0,
+        "error": "",
+        "created_at": stamp,
+        "created_ts": time.time(),
+        "started_at": "",
+        "finished_at": "",
+        "finished_ts": 0.0,
+    }
+    with _export_jobs_lock:
+        cleanup_export_jobs()
+        _export_jobs[job_id] = job
+    threading.Thread(target=run_export_job, args=(job_id,), daemon=True).start()
+    return export_job_public(job)
+
+
+def run_export_job(job_id: str) -> None:
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+        if not job:
+            return
+        export_format = job["format"]
+        job["status"] = "running"
+        job["started_at"] = now()
+
+    try:
+        content = build_export_file(export_format)
+    except Exception as exc:
+        traceback.print_exc()
+        with _export_jobs_lock:
+            job = _export_jobs.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = str(exc) or "导出失败"
+                job["finished_at"] = now()
+                job["finished_ts"] = time.time()
+        return
+
+    with _export_jobs_lock:
+        job = _export_jobs.get(job_id)
+        if job:
+            job["status"] = "done"
+            job["content"] = content
+            job["size"] = len(content)
+            job["finished_at"] = now()
+            job["finished_ts"] = time.time()
+
+
+def get_export_job(job_id: str) -> dict:
+    with _export_jobs_lock:
+        cleanup_export_jobs()
+        job = _export_jobs.get(job_id)
+        if not job:
+            raise ApiError(404, "导出任务不存在或已过期")
+        return dict(job)
+
+
 class ApiError(Exception):
     def __init__(self, status: int, message: str):
         self.status = status
@@ -1075,21 +1204,35 @@ class Handler(BaseHTTPRequestHandler):
         if not self.is_authenticated():
             raise ApiError(401, "请先输入密钥登录")
 
+        if method == "POST" and parts == ["api", "export-jobs"]:
+            data = self.read_json()
+            export_format = validate_export_format(data.get("format", "docx"))
+            self.send_json({"job": start_export_job(export_format)}, 202)
+            return
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["api", "export-jobs"]:
+            job = get_export_job(parts[2])
+            self.send_json({"job": export_job_public(job)})
+            return
+
+        if method == "GET" and len(parts) == 4 and parts[:2] == ["api", "export-jobs"] and parts[3] == "download":
+            job = get_export_job(parts[2])
+            if job["status"] == "error":
+                raise ApiError(500, job.get("error") or "导出失败")
+            if job["status"] != "done":
+                raise ApiError(409, "导出任务尚未完成")
+            self.send_download(job["content"], job["content_type"], job["filename"])
+            return
+
         if method == "GET" and parts == ["api", "export"]:
             params = parse_qs(query)
-            export_format = (params.get("format", ["docx"])[0] or "docx").lower()
-            blocks = build_export_blocks()
-            if export_format == "docx":
-                self.send_download(
-                    build_docx(blocks),
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "cs2-tactics-book.docx",
-                )
-                return
-            if export_format == "pdf":
-                self.send_download(build_pdf(blocks), "application/pdf", "cs2-tactics-book.pdf")
-                return
-            raise ApiError(400, "导出格式必须是 docx 或 pdf")
+            export_format = validate_export_format((params.get("format", ["docx"])[0] or "docx").lower())
+            self.send_download(
+                build_export_file(export_format),
+                export_content_type(export_format),
+                export_filename(export_format),
+            )
+            return
 
         if method == "GET" and parts == ["api", "maps"]:
             with connect() as conn:

@@ -501,9 +501,19 @@ function filenameFromDisposition(disposition, fallback) {
   return match ? match[1] : fallback;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 async function downloadExport(format) {
-  toast("正在生成文件，请稍候...");
-  const response = await fetch(`/api/export?format=${encodeURIComponent(format)}`, {
+  toast("正在创建导出任务...");
+  const created = await api("/api/export-jobs", {
+    method: "POST",
+    body: JSON.stringify({ format }),
+  });
+  const job = await waitForExportJob(created.job?.id);
+  toast("正在下载文件...");
+  const response = await fetch(`/api/export-jobs/${encodeURIComponent(job.id)}/download`, {
     credentials: "same-origin",
   });
   if (!response.ok) {
@@ -515,26 +525,26 @@ async function downloadExport(format) {
     if (response.status === 401) showLogin(message);
     throw new Error(message);
   }
-  const total = Number(response.headers.get("Content-Length") || 0);
-  const reader = response.body?.getReader();
-  if (!reader || !total) {
-    // Fallback: no streaming
-    const blob = await response.blob();
-    triggerDownload(blob, format, response);
-    return;
-  }
-  let received = 0;
-  const chunks = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    const pct = Math.min(100, Math.round((received / total) * 100));
-    toast(`正在下载... ${pct}%`);
-  }
-  const blob = new Blob(chunks);
+  const blob = await response.blob();
   triggerDownload(blob, format, response);
+}
+
+async function waitForExportJob(jobId) {
+  if (!jobId) throw new Error("导出任务创建失败");
+  const startedAt = Date.now();
+  let interval = 600;
+  while (true) {
+    if (Date.now() - startedAt > 180000) {
+      throw new Error("导出超时，请稍后重试");
+    }
+    const data = await api(`/api/export-jobs/${encodeURIComponent(jobId)}`);
+    const job = data.job || {};
+    if (job.status === "done") return job;
+    if (job.status === "error") throw new Error(job.error || "导出失败");
+    toast(job.status === "running" ? "正在生成文件..." : "导出任务排队中...");
+    await sleep(interval);
+    interval = Math.min(1800, interval + 200);
+  }
 }
 
 function triggerDownload(blob, format, response) {
@@ -840,6 +850,47 @@ function renderTactics(side) {
   syncEconomyCustom();
 }
 
+function tacticDisplayList(side) {
+  const list = getTacticList(side);
+  const draft = state.selectedTacticIds[side] === `draft-${side}` ? state.tacticDrafts[side] : null;
+  return draft ? [draft, ...list] : list;
+}
+
+function isActiveTacticSide(side) {
+  const tab = currentTab();
+  return tab.type === "tactics" && tab.side === side;
+}
+
+function renderTacticListOnly(side) {
+  if (!isActiveTacticSide(side)) return;
+  const container = document.querySelector(".tactic-list");
+  if (!container) return;
+  const displayList = tacticDisplayList(side);
+  container.innerHTML = displayList.length
+    ? displayList.map((tactic) => renderTacticCard(tactic, side)).join("")
+    : `<div class="empty-state">${emptyStateIcon}<p>暂无战术</p></div>`;
+}
+
+function renderTacticEditorOnly(side) {
+  if (!isActiveTacticSide(side)) return;
+  const editor = document.querySelector(".editor");
+  if (!editor) return;
+  const selectedTactic = getCurrentTactic(side);
+  editor.className = `panel editor ${selectedTactic ? "has-selection" : "no-selection"}`;
+  editor.innerHTML = renderTacticEditor(side);
+  syncEconomyCustom();
+}
+
+function renderTacticViewParts(side, options = {}) {
+  const { list = true, editor = true, counts = false } = options;
+  if (counts) {
+    renderMapList();
+    renderTabs();
+  }
+  if (list) renderTacticListOnly(side);
+  if (editor) renderTacticEditorOnly(side);
+}
+
 function renderTacticCard(tactic, side) {
   return `
     <button class="tactic-card ${sameId(state.selectedTacticIds[side], tactic.id) ? "active" : ""}"
@@ -1083,6 +1134,30 @@ function renderNotes(side) {
   `;
 }
 
+function renderNoteListOnly(side) {
+  const tab = currentTab();
+  if (tab.type !== "notes" || tab.side !== side) return;
+  const container = document.querySelector(".notes-list");
+  if (!container) return;
+  const notes = state.content?.notes?.[side] || [];
+  container.innerHTML = notes.length
+    ? notes.map((note, index) => renderNoteCard(note, index)).join("")
+    : `<div class="empty-state">${emptyStateIcon}<p>暂无内容</p></div>`;
+}
+
+function renderNoteViewParts(side, options = {}) {
+  const { list = true, counts = false, clearDraft = false } = options;
+  if (counts) {
+    renderMapList();
+    renderTabs();
+  }
+  if (list) renderNoteListOnly(side);
+  if (clearDraft) {
+    const input = $("#newNoteText");
+    if (input) input.value = "";
+  }
+}
+
 function renderNoteCard(note, index) {
   return `
     <article class="note-card">
@@ -1178,6 +1253,7 @@ async function saveMap() {
     toast("地图名称不能为空", "error");
     return;
   }
+  let needsFullRender = false;
   if (state.mapModalMode === "edit") {
     const map = currentMap();
     if (!map) return;
@@ -1197,10 +1273,16 @@ async function saveMap() {
     state.selectedMapId = createdMap.id;
     clearDraftSelections();
     applyContent(emptyContentForMap(createdMap));
+    needsFullRender = true;
     toast("地图已创建");
   }
   closeMapModal();
-  renderAll();
+  if (needsFullRender) {
+    renderAll();
+  } else {
+    renderMapList();
+    renderTopbar();
+  }
 }
 
 function openMapModal(mode) {
@@ -1242,7 +1324,7 @@ async function saveTactic(side) {
   state.selectedTacticIds[side] = data.tactic.id;
   state.tacticDrafts[side] = null;
   toast("战术已保存");
-  renderAll();
+  renderTacticViewParts(side, { counts: isDraft });
 }
 
 async function deleteTactic(side) {
@@ -1251,7 +1333,7 @@ async function deleteTactic(side) {
   if (tactic.id === `draft-${side}`) {
     state.tacticDrafts[side] = null;
     state.selectedTacticIds[side] = null;
-    renderContent();
+    renderTacticViewParts(side);
     return;
   }
   if (!confirm(`删除战术「${tactic.title || "未命名"}」？`)) return;
@@ -1261,7 +1343,7 @@ async function deleteTactic(side) {
   }
   state.selectedTacticIds[side] = null;
   toast("战术已删除");
-  renderAll();
+  renderTacticViewParts(side, { counts: true });
 }
 
 async function addNote(side) {
@@ -1277,7 +1359,7 @@ async function addNote(side) {
   upsertNote(data.note);
   adjustCurrentMapCount("notes", side, 1);
   toast("内容已保存");
-  renderAll();
+  renderNoteViewParts(side, { counts: true, clearDraft: true });
 }
 
 async function saveNote(id) {
@@ -1293,7 +1375,7 @@ async function saveNote(id) {
   });
   upsertNote(data.note);
   toast("内容已更新");
-  renderAll();
+  renderNoteViewParts(data.note.side);
 }
 
 async function deleteNote(id) {
@@ -1302,7 +1384,12 @@ async function deleteNote(id) {
   await api(`/api/notes/${id}`, { method: "DELETE" });
   if (side && removeNoteFromState(id)) adjustCurrentMapCount("notes", side, -1);
   toast("内容已删除");
-  renderAll();
+  if (side) {
+    renderNoteViewParts(side, { counts: true });
+  } else {
+    renderTabs();
+    renderMapList();
+  }
 }
 
 document.addEventListener("click", async (event) => {
@@ -1325,7 +1412,7 @@ document.addEventListener("click", async (event) => {
 
     if (action === "download-export") {
       await downloadExport(target.dataset.format || "docx");
-      toast("导出已开始");
+      toast("导出已下载");
       return;
     }
 
@@ -1396,7 +1483,7 @@ document.addEventListener("click", async (event) => {
       hydrateCurrentTacticFromForm();
       state.tacticDrafts[side] = emptyTactic(side);
       state.selectedTacticIds[side] = `draft-${side}`;
-      renderContent();
+      renderTacticViewParts(side);
       return;
     }
 
@@ -1406,7 +1493,7 @@ document.addEventListener("click", async (event) => {
       const editorPanel = document.querySelector(".editor");
       const scrollY = editorPanel?.scrollTop || 0;
       state.selectedTacticIds[side] = target.dataset.id;
-      renderContent();
+      renderTacticViewParts(side);
       const newEditor = document.querySelector(".editor");
       if (newEditor) newEditor.scrollTop = scrollY;
       return;
@@ -1426,7 +1513,7 @@ document.addEventListener("click", async (event) => {
       const tactic = getCurrentTactic(target.dataset.side);
       if (!tactic) return;
       tactic.early_commands.push({ id: uid("cmd"), priority: 1, text: "" });
-      renderContent();
+      renderTacticViewParts(target.dataset.side);
       return;
     }
 
@@ -1435,7 +1522,7 @@ document.addEventListener("click", async (event) => {
       const tactic = getCurrentTactic(tab.side);
       hydrateCurrentTacticFromForm();
       tactic.early_commands = tactic.early_commands.filter((item) => item.id !== target.dataset.id);
-      renderContent();
+      renderTacticViewParts(tab.side);
       return;
     }
 
@@ -1447,7 +1534,7 @@ document.addEventListener("click", async (event) => {
         tactic.tactic_custom_tags = unique([...(tactic.tactic_custom_tags || []), value]);
         if (!tactic.tactic_tags.includes("自定义")) tactic.tactic_tags.push("自定义");
       }
-      renderContent();
+      renderTacticViewParts(target.dataset.side);
       return;
     }
 
@@ -1456,7 +1543,7 @@ document.addEventListener("click", async (event) => {
       const tactic = getCurrentTactic(tab.side);
       hydrateCurrentTacticFromForm();
       tactic.tactic_custom_tags = tactic.tactic_custom_tags.filter((item) => item !== target.dataset.tag);
-      renderContent();
+      renderTacticViewParts(tab.side);
       return;
     }
 
@@ -1466,7 +1553,7 @@ document.addEventListener("click", async (event) => {
       if (!tactic) return;
       tactic.decision_tree = normalizeDecisionTree(tactic.decision_tree);
       tactic.decision_tree.push(emptyDecisionNode());
-      renderContent();
+      renderTacticViewParts(target.dataset.side);
       return;
     }
 
@@ -1476,14 +1563,14 @@ document.addEventListener("click", async (event) => {
       if (!node) return;
       node.children = node.children || [];
       node.children.push(emptyDecisionNode());
-      renderContent();
+      renderTacticViewParts(currentTab().side);
       return;
     }
 
     if (action === "remove-decision-node") {
       hydrateCurrentTacticFromForm();
       removeDecisionNode(target.dataset.path);
-      renderContent();
+      renderTacticViewParts(currentTab().side);
       return;
     }
 

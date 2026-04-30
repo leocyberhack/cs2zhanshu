@@ -268,7 +268,7 @@ def grouped_commands(commands: list[dict]) -> dict[int, list[str]]:
 
 def add_decision_blocks(blocks: list[dict], nodes: list[dict], level: int) -> None:
     if not nodes:
-        blocks.append({"text": "暂无中期判断", "level": level, "kind": "muted"})
+        blocks.append({"text": "无", "level": level, "kind": "muted"})
         return
     for index, node in enumerate(nodes, start=1):
         condition = node.get("condition") or "未填写条件"
@@ -284,7 +284,7 @@ def add_decision_blocks(blocks: list[dict], nodes: list[dict], level: int) -> No
 def add_tactic_blocks(blocks: list[dict], title: str, tactics: list[dict]) -> None:
     blocks.append({"text": title, "level": 1, "kind": "heading2"})
     if not tactics:
-        blocks.append({"text": "暂无战术", "level": 2, "kind": "muted"})
+        blocks.append({"text": "无", "level": 2, "kind": "muted"})
         return
     for index, tactic in enumerate(tactics, start=1):
         economy, tags = tactic_display_meta(tactic)
@@ -299,7 +299,7 @@ def add_tactic_blocks(blocks: list[dict], title: str, tactics: list[dict]) -> No
                 for text in commands[priority]:
                     blocks.append({"text": f"- {text}", "level": 5, "kind": "body"})
         else:
-            blocks.append({"text": "暂无前期命令", "level": 4, "kind": "muted"})
+            blocks.append({"text": "无", "level": 4, "kind": "muted"})
         blocks.append({"text": "中期决策", "level": 3, "kind": "label"})
         add_decision_blocks(blocks, tactic.get("decision_tree", []), 4)
 
@@ -307,7 +307,7 @@ def add_tactic_blocks(blocks: list[dict], title: str, tactics: list[dict]) -> No
 def add_note_blocks(blocks: list[dict], title: str, notes: list[dict]) -> None:
     blocks.append({"text": title, "level": 1, "kind": "heading2"})
     if not notes:
-        blocks.append({"text": "暂无内容", "level": 2, "kind": "muted"})
+        blocks.append({"text": "无", "level": 2, "kind": "muted"})
         return
     for index, note in enumerate(notes, start=1):
         body = " ".join(note["body"].splitlines()).strip()
@@ -317,10 +317,7 @@ def add_note_blocks(blocks: list[dict], title: str, notes: list[dict]) -> None:
 def build_export_blocks() -> list[dict]:
     with connect() as conn:
         maps = conn.execute("SELECT * FROM maps ORDER BY sort_order, id").fetchall()
-        blocks = [
-            {"text": "CS2 战术本导出", "level": 0, "kind": "title"},
-            {"text": f"导出时间：{now()}", "level": 0, "kind": "meta"},
-        ]
+        blocks = []
         for map_index, map_row in enumerate(maps):
             map_id = map_row["id"]
             tactics = conn.execute(
@@ -346,22 +343,26 @@ def build_export_blocks() -> list[dict]:
 
 
 def docx_paragraph(text: str, kind: str, level: int, page_break: bool = False) -> str:
-    size_map = {"title": 36, "heading1": 30, "heading2": 24, "heading3": 21, "label": 20, "meta": 18}
+    size_map = {"heading1": 40, "heading2": 30, "heading3": 23, "label": 21, "meta": 20}
     size = size_map.get(kind, 19)
-    bold = kind in {"title", "heading1", "heading2", "heading3", "label"}
-    spacing_before = 220 if kind in {"heading1", "heading2"} else 70
-    spacing_after = 90 if kind in {"title", "heading1", "heading2"} else 40
-    indent = max(0, level) * 360
+    bold = kind in {"heading1", "heading2", "heading3", "label"}
+    italic = kind == "heading1"
+    centered = kind in {"heading1", "heading2"}
+    spacing_before = 40
+    spacing_after = 40
+    indent = 0 if centered else max(0, level) * 360
+    align_xml = "<w:jc w:val=\"center\"/>" if centered else ""
     bold_xml = "<w:b/>" if bold else ""
+    italic_xml = "<w:i/>" if italic else ""
     color = "66756E" if kind in {"meta", "muted"} else "18211D"
     break_xml = "<w:r><w:br w:type=\"page\"/></w:r>" if page_break else ""
     return (
         "<w:p>"
-        f"<w:pPr><w:spacing w:before=\"{spacing_before}\" w:after=\"{spacing_after}\"/>"
-        f"<w:ind w:left=\"{indent}\"/></w:pPr>"
+        f"<w:pPr><w:spacing w:before=\"{spacing_before}\" w:after=\"{spacing_after}\" w:line=\"300\" w:lineRule=\"auto\"/>"
+        f"<w:ind w:left=\"{indent}\"/>{align_xml}</w:pPr>"
         f"{break_xml}"
         "<w:r>"
-        f"<w:rPr>{bold_xml}<w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/></w:rPr>"
+        f"<w:rPr>{bold_xml}{italic_xml}<w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/></w:rPr>"
         f"<w:t xml:space=\"preserve\">{xml_escape(text)}</w:t>"
         "</w:r></w:p>"
     )
@@ -420,9 +421,17 @@ def wrap_pdf_text(text: str, max_units: float) -> list[str]:
     return lines
 
 
-def pdf_text_command(text: str, x: int, y: int, size: int) -> str:
+def pdf_text_width(text: str, size: int) -> float:
+    return pdf_units(text) * size * 0.54
+
+
+def pdf_text_command(text: str, x: int, y: int, size: int, bold: bool = False, italic: bool = False) -> str:
     hex_text = text.encode("utf-16-be").hex().upper()
-    return f"BT /F1 {size} Tf 1 0 0 1 {x} {y} Tm <{hex_text}> Tj ET\n"
+    skew = "0.18" if italic else "0"
+    command = f"BT /F1 {size} Tf 1 0 {skew} 1 {x} {y} Tm <{hex_text}> Tj ET\n"
+    if bold:
+        command += f"BT /F1 {size} Tf 1 0 {skew} 1 {x + 0.45:.2f} {y} Tm <{hex_text}> Tj ET\n"
+    return command
 
 
 def build_pdf(blocks: list[dict]) -> bytes:
@@ -431,7 +440,8 @@ def build_pdf(blocks: list[dict]) -> bytes:
     y = page_height - margin_y
     pages: list[str] = []
     current = ""
-    size_map = {"title": 18, "heading1": 16, "heading2": 13, "heading3": 12, "label": 11, "meta": 10}
+    size_map = {"heading1": 22, "heading2": 16, "heading3": 12, "label": 11, "meta": 10}
+    line_height = 22
 
     def new_page() -> None:
         nonlocal current, y
@@ -446,18 +456,17 @@ def build_pdf(blocks: list[dict]) -> bytes:
             new_page()
         level = block["level"]
         size = size_map.get(kind, 10)
-        leading = size + 6
-        if kind in {"title", "heading1"}:
-            y -= 8
+        centered = kind in {"heading1", "heading2"}
+        bold = kind in {"heading1", "heading2", "heading3", "label"}
+        italic = kind == "heading1"
         x = margin_x + level * 18
         max_units = max(18, (page_width - x - margin_x) / max(size * 0.58, 1))
         for line in wrap_pdf_text(block["text"], max_units):
             if y < margin_y:
                 new_page()
-            current += pdf_text_command(line, x, y, size)
-            y -= leading
-        if kind in {"title", "heading1", "heading2"}:
-            y -= 4
+            line_x = int((page_width - pdf_text_width(line, size)) / 2) if centered else x
+            current += pdf_text_command(line, line_x, y, size, bold=bold, italic=italic)
+            y -= line_height
     if current:
         pages.append(current)
 

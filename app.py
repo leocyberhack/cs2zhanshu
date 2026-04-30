@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
 import io
 import json
 import mimetypes
 import os
+import random
 import re
 import secrets
 import socket
+import signal
 import sqlite3
+import threading
 import time
+import traceback
 import zipfile
+from email.utils import formatdate, parsedate_to_datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,15 +32,24 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(BASE_DIR / "tactics.db"))).resolve(
 ACCESS_KEY_ENV = "APP_ACCESS_KEY"
 AUTH_COOKIE = "cs2_tactics_session"
 SESSION_MAX_AGE = 30 * 24 * 60 * 60
+MAX_JSON_BODY_SIZE = 2 * 1024 * 1024
+GZIP_MIN_BODY_SIZE = 1024
+KEEP_ALIVE_TIMEOUT = 15
+VERSIONED_ASSETS = ("styles.css", "app.js")
 
 DEFAULT_MAPS = ["Mirage", "Dust2", "Ancient", "Nuke", "Overpass", "Anubis"]
 SIDES = {"T", "CT"}
 ECONOMY_OPTIONS = {"手枪局", "eco局", "半起局", "反eco局", "长枪局", "通用", "自定义"}
 TACTIC_TAG_OPTIONS = {"常规默认", "非常规", "爆弹", "rush", "自定义"}
 
+_RE_MAP = re.compile(r"/api/maps/(\d+)$")
+_RE_MAP_CONTENT = re.compile(r"/api/maps/(\d+)/content$")
+_RE_TACTIC = re.compile(r"/api/tactics/(\d+)$")
+_RE_NOTE = re.compile(r"/api/notes/(\d+)$")
+
 
 def now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
 def get_access_key() -> str:
@@ -48,6 +63,11 @@ def get_access_key() -> str:
 
 def auth_configured() -> bool:
     return bool(get_access_key())
+
+
+def is_secure_cookie_context() -> bool:
+    env_value = os.environ.get("COOKIE_SECURE", "").strip().lower()
+    return bool(os.environ.get("PORT")) or env_value in {"1", "true", "yes"}
 
 
 def sign_session(timestamp: str, nonce: str) -> str:
@@ -79,16 +99,49 @@ def verify_session_token(token: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback_obj):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback_obj)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+_thread_local = threading.local()
+
+
+def get_conn() -> sqlite3.Connection:
+    """Return a thread-local connection, creating one if needed."""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    _thread_local.conn = conn
     return conn
 
 
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS maps (
@@ -123,6 +176,12 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_tactics_map_side_updated
+            ON tactics(map_id, side, updated_at DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_notes_map_side_sort
+            ON notes(map_id, side, sort_order, id);
             """
         )
         count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
@@ -141,13 +200,17 @@ def decode_json(value: str, fallback):
         return fallback
 
 
+def unique_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time() * 1000)}-{random.randint(0, 0xffff):04x}"
+
+
 def normalize_command(command: dict, index: int) -> dict:
     try:
         priority = int(command.get("priority", 1))
     except (TypeError, ValueError):
         priority = 1
     return {
-        "id": str(command.get("id") or f"cmd-{int(time.time() * 1000)}-{index}"),
+        "id": str(command.get("id") or unique_id(f"cmd-{index}")),
         "priority": max(1, priority),
         "text": str(command.get("text", "")).strip(),
     }
@@ -163,7 +226,7 @@ def normalize_commands(commands) -> list[dict]:
 
 def empty_decision_node() -> dict:
     return {
-        "id": f"node-{int(time.time() * 1000)}",
+        "id": unique_id("node"),
         "condition": "",
         "thenAction": "",
         "children": [],
@@ -176,7 +239,7 @@ def normalize_decision_node(node) -> dict:
     legacy_children = node.get("thenChildren", [])
     children = node.get("children", legacy_children)
     normalized = {
-        "id": str(node.get("id") or f"node-{int(time.time() * 1000)}"),
+        "id": str(node.get("id") or unique_id("node")),
         "condition": str(node.get("condition", "")).strip(),
         "thenAction": str(node.get("thenAction", "")).strip(),
         "children": [],
@@ -227,26 +290,78 @@ def note_to_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def map_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    tactic_counts = {
-        side: conn.execute("SELECT COUNT(*) FROM tactics WHERE map_id = ? AND side = ?", (row["id"], side)).fetchone()[0]
-        for side in SIDES
+def empty_counts() -> dict:
+    return {
+        "t_tactics": 0,
+        "ct_tactics": 0,
+        "t_notes": 0,
+        "ct_notes": 0,
     }
-    note_counts = {
-        side: conn.execute("SELECT COUNT(*) FROM notes WHERE map_id = ? AND side = ?", (row["id"], side)).fetchone()[0]
-        for side in SIDES
-    }
+
+
+def load_map_counts(conn: sqlite3.Connection, map_ids: list[int] | None = None) -> dict[int, dict]:
+    counts_by_map: dict[int, dict] = {}
+    where = ""
+    params: tuple[int, ...] = ()
+    if map_ids is not None:
+        if not map_ids:
+            return counts_by_map
+        placeholders = ", ".join("?" for _ in map_ids)
+        where = f" WHERE map_id IN ({placeholders})"
+        params = tuple(map_ids)
+
+    for row in conn.execute(
+        f"SELECT map_id, side, COUNT(*) AS count FROM tactics{where} GROUP BY map_id, side",
+        params,
+    ):
+        key = "t_tactics" if row["side"] == "T" else "ct_tactics"
+        counts_by_map.setdefault(row["map_id"], empty_counts())[key] = row["count"]
+
+    for row in conn.execute(
+        f"SELECT map_id, side, COUNT(*) AS count FROM notes{where} GROUP BY map_id, side",
+        params,
+    ):
+        key = "t_notes" if row["side"] == "T" else "ct_notes"
+        counts_by_map.setdefault(row["map_id"], empty_counts())[key] = row["count"]
+
+    return counts_by_map
+
+
+def map_to_dict(conn: sqlite3.Connection, row: sqlite3.Row, counts: dict | None = None) -> dict:
+    if counts is None:
+        counts = load_map_counts(conn, [row["id"]]).get(row["id"], empty_counts())
     return {
         "id": row["id"],
         "name": row["name"],
         "sort_order": row["sort_order"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "counts": {
-            "t_tactics": tactic_counts["T"],
-            "ct_tactics": tactic_counts["CT"],
-            "t_notes": note_counts["T"],
-            "ct_notes": note_counts["CT"],
+        "counts": counts,
+    }
+
+
+def load_maps(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM maps ORDER BY sort_order, id").fetchall()
+    counts_by_map = load_map_counts(conn)
+    return [map_to_dict(conn, row, counts_by_map.get(row["id"], empty_counts())) for row in rows]
+
+
+def map_content_to_dict(conn: sqlite3.Connection, map_id: int, preloaded_counts: dict | None = None) -> dict:
+    row = require_map(conn, map_id)
+    tactics = conn.execute(
+        "SELECT * FROM tactics WHERE map_id = ? ORDER BY updated_at DESC, id DESC", (map_id,)
+    ).fetchall()
+    notes = conn.execute("SELECT * FROM notes WHERE map_id = ? ORDER BY sort_order, id", (map_id,)).fetchall()
+    counts = preloaded_counts if preloaded_counts is not None else None
+    return {
+        "map": map_to_dict(conn, row, counts),
+        "tactics": {
+            "T": [tactic_to_dict(item) for item in tactics if item["side"] == "T"],
+            "CT": [tactic_to_dict(item) for item in tactics if item["side"] == "CT"],
+        },
+        "notes": {
+            "T": [note_to_dict(item) for item in notes if item["side"] == "T"],
+            "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
         },
     }
 
@@ -317,23 +432,20 @@ def add_note_blocks(blocks: list[dict], title: str, notes: list[dict]) -> None:
 def build_export_blocks() -> list[dict]:
     with connect() as conn:
         maps = conn.execute("SELECT * FROM maps ORDER BY sort_order, id").fetchall()
+        tactics_by_map = {row["id"]: {"T": [], "CT": []} for row in maps}
+        notes_by_map = {row["id"]: {"T": [], "CT": []} for row in maps}
+        for tactic_row in conn.execute("SELECT * FROM tactics ORDER BY map_id, side, updated_at DESC, id DESC"):
+            tactics_by_map.setdefault(tactic_row["map_id"], {"T": [], "CT": []})[tactic_row["side"]].append(
+                tactic_to_dict(tactic_row)
+            )
+        for note_row in conn.execute("SELECT * FROM notes ORDER BY map_id, side, sort_order, id"):
+            notes_by_map.setdefault(note_row["map_id"], {"T": [], "CT": []})[note_row["side"]].append(
+                note_to_dict(note_row)
+            )
         blocks = []
         for map_index, map_row in enumerate(maps):
-            map_id = map_row["id"]
-            tactics = conn.execute(
-                "SELECT * FROM tactics WHERE map_id = ? ORDER BY side, updated_at DESC, id DESC", (map_id,)
-            ).fetchall()
-            notes = conn.execute(
-                "SELECT * FROM notes WHERE map_id = ? ORDER BY side, sort_order, id", (map_id,)
-            ).fetchall()
-            tactics_by_side = {
-                "T": [tactic_to_dict(item) for item in tactics if item["side"] == "T"],
-                "CT": [tactic_to_dict(item) for item in tactics if item["side"] == "CT"],
-            }
-            notes_by_side = {
-                "T": [note_to_dict(item) for item in notes if item["side"] == "T"],
-                "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
-            }
+            tactics_by_side = tactics_by_map.get(map_row["id"], {"T": [], "CT": []})
+            notes_by_side = notes_by_map.get(map_row["id"], {"T": [], "CT": []})
             blocks.append({"text": map_row["name"], "level": 0, "kind": "heading1", "page_break": map_index > 0})
             add_tactic_blocks(blocks, "T方战术", tactics_by_side["T"])
             add_tactic_blocks(blocks, "CT方战术", tactics_by_side["CT"])
@@ -400,54 +512,56 @@ def build_docx(blocks: list[dict]) -> bytes:
     return output.getvalue()
 
 
-def pdf_units(text: str) -> float:
-    return sum(1.0 if ord(char) > 127 else 0.55 for char in text)
+def _find_cjk_font() -> str:
+    """Find a CJK font file, checking bundled font first, then system fonts."""
+    candidates = [
+        BASE_DIR / "fonts" / "SimHei.ttf",
+        BASE_DIR / "fonts" / "NotoSansSC-Regular.otf",
+        BASE_DIR / "fonts" / "NotoSansSC-Regular.ttf",
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+        Path("/usr/share/fonts/noto-cjk/NotoSansSC-Regular.otf"),
+        Path(r"C:\Windows\Fonts\simhei.ttf"),
+        Path(r"C:\Windows\Fonts\msyh.ttc"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    raise FileNotFoundError(
+        "找不到可用的中文字体。请将 SimHei.ttf 或 NotoSansSC-Regular.otf 放入 fonts/ 目录。"
+    )
 
 
-def wrap_pdf_text(text: str, max_units: float) -> list[str]:
-    if not text:
-        return [""]
-    lines: list[str] = []
-    current = ""
-    for char in text:
-        candidate = current + char
-        if current and pdf_units(candidate) > max_units:
-            lines.append(current)
-            current = char
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines
+def _register_pdf_font() -> str:
+    """Register a CJK font with reportlab and return the font name."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
-
-def pdf_text_width(text: str, size: int) -> float:
-    return pdf_units(text) * size * 0.54
-
-
-def pdf_text_command(text: str, x: int, y: int, size: int, bold: bool = False, italic: bool = False) -> str:
-    hex_text = text.encode("utf-16-be").hex().upper()
-    skew = "0.18" if italic else "0"
-    command = f"BT /F1 {size} Tf 1 0 {skew} 1 {x} {y} Tm <{hex_text}> Tj ET\n"
-    if bold:
-        command += f"BT /F1 {size} Tf 1 0 {skew} 1 {x + 0.45:.2f} {y} Tm <{hex_text}> Tj ET\n"
-    return command
+    font_name = "CJKFont"
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        font_path = _find_cjk_font()
+        pdfmetrics.registerFont(TTFont(font_name, font_path))
+    return font_name
 
 
 def build_pdf(blocks: list[dict]) -> bytes:
-    page_width, page_height = 595, 842
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    font_name = _register_pdf_font()
+    page_width, page_height = A4  # 595 x 842
     margin_x, margin_y = 48, 50
-    y = page_height - margin_y
-    pages: list[str] = []
-    current = ""
-    size_map = {"heading1": 22, "heading2": 16, "heading3": 12, "label": 11, "meta": 10}
     line_height = 22
+    size_map = {"heading1": 22, "heading2": 16, "heading3": 12, "label": 11, "meta": 10}
+
+    output = io.BytesIO()
+    c = canvas.Canvas(output, pagesize=A4)
+    c.setTitle("CS2 战术本")
+    y = page_height - margin_y
 
     def new_page() -> None:
-        nonlocal current, y
-        if current:
-            pages.append(current)
-        current = ""
+        nonlocal y
+        c.showPage()
         y = page_height - margin_y
 
     for block in blocks:
@@ -456,64 +570,55 @@ def build_pdf(blocks: list[dict]) -> bytes:
             new_page()
         level = block["level"]
         size = size_map.get(kind, 10)
-        centered = kind == "heading1"
         bold = kind in {"heading1", "heading2", "heading3", "label"}
-        italic = kind == "heading1"
+        centered = kind == "heading1"
         x = margin_x + level * 18
-        max_units = max(18, (page_width - x - margin_x) / max(size * 0.58, 1))
-        for line in wrap_pdf_text(block["text"], max_units):
+        max_width = page_width - x - margin_x
+
+        text = block["text"]
+        if not text:
+            y -= line_height
+            continue
+
+        # Simple text wrapping
+        lines = _wrap_text_for_pdf(c, font_name, size, text, max_width)
+        for line in lines:
             if y < margin_y:
                 new_page()
-            line_x = int((page_width - pdf_text_width(line, size)) / 2) if centered else x
-            current += pdf_text_command(line, line_x, y, size, bold=bold, italic=italic)
+            c.setFont(font_name, size)
+            if centered:
+                text_width = c.stringWidth(line, font_name, size)
+                draw_x = (page_width - text_width) / 2
+            else:
+                draw_x = x
+            if bold:
+                # Simulate bold by drawing text twice with a slight offset
+                c.drawString(draw_x, y, line)
+                c.drawString(draw_x + 0.4, y, line)
+            else:
+                c.drawString(draw_x, y, line)
             y -= line_height
-    if current:
-        pages.append(current)
 
-    objects: list[bytes | None] = [None]
-    objects.append(b"")
-    objects.append(b"")
-    font_object = (
-        b"<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H "
-        b"/DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light "
-        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> "
-        b"/FontDescriptor << /Type /FontDescriptor /FontName /STSong-Light /Flags 6 "
-        b"/FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 880 /Descent -120 "
-        b"/CapHeight 880 /StemV 80 >> >>] >>"
-    )
-    objects.append(font_object)
-    page_object_ids: list[int] = []
-    for page in pages or [""]:
-        stream = page.encode("ascii")
-        content_obj_id = len(objects)
-        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
-        page_obj_id = len(objects)
-        page_object_ids.append(page_obj_id)
-        objects.append(
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
-            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_obj_id} 0 R >>".encode("ascii")
-        )
-    kids = " ".join(f"{item} 0 R" for item in page_object_ids)
-    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
-    objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_ids)} >>".encode("ascii")
-
-    output = io.BytesIO()
-    output.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = [0]
-    for object_id, body in enumerate(objects[1:], start=1):
-        offsets.append(output.tell())
-        output.write(f"{object_id} 0 obj\n".encode("ascii"))
-        output.write(body or b"")
-        output.write(b"\nendobj\n")
-    xref_offset = output.tell()
-    output.write(f"xref\n0 {len(objects)}\n".encode("ascii"))
-    output.write(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        output.write(f"{offset:010d} 00000 n \n".encode("ascii"))
-    output.write(
-        f"trailer\n<< /Size {len(objects)} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode("ascii")
-    )
+    c.save()
     return output.getvalue()
+
+
+def _wrap_text_for_pdf(c, font_name: str, size: int, text: str, max_width: float) -> list[str]:
+    """Wrap text to fit within max_width using actual font metrics."""
+    if not text:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        candidate = current + char
+        if current and c.stringWidth(candidate, font_name, size) > max_width:
+            lines.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 class ApiError(Exception):
@@ -560,6 +665,30 @@ def validate_side(side: str) -> str:
     return side
 
 
+def parse_map_id(value) -> int:
+    if isinstance(value, bool):
+        raise ApiError(400, "地图 ID 必须是正整数")
+    if isinstance(value, int):
+        map_id = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped.isdigit():
+            raise ApiError(400, "地图 ID 必须是正整数")
+        map_id = int(stripped)
+    else:
+        raise ApiError(400, "地图 ID 必须是正整数")
+    if map_id <= 0:
+        raise ApiError(400, "地图 ID 必须是正整数")
+    return map_id
+
+
+def parse_optional_map_id(value) -> int | None:
+    try:
+        return parse_map_id(value)
+    except ApiError:
+        return None
+
+
 def validate_tactic_payload(data: dict) -> dict:
     title = str(data.get("title", "")).strip()
     if not title:
@@ -604,10 +733,19 @@ def validate_tactic_payload(data: dict) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     server_version = "CS2Tactics/1.0"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(KEEP_ALIVE_TIMEOUT)
 
     def log_message(self, format: str, *args) -> None:
         print("[%s] %s" % (self.log_date_time_string(), format % args))
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        elapsed = (time.monotonic() - self._request_start) * 1000 if hasattr(self, "_request_start") else 0
+        self.log_message('"%s" %s %s %.0fms', self.requestline, str(code), str(size), elapsed)
 
     def do_GET(self) -> None:
         self.handle_request("GET")
@@ -622,13 +760,14 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request("DELETE")
 
     def handle_request(self, method: str) -> None:
+        self._request_start = time.monotonic()
         try:
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
             if path.startswith("/api/"):
                 self.handle_api(method, path, parsed.query)
             elif method == "GET":
-                self.serve_static(path)
+                self.serve_static(path, parsed.query)
             else:
                 raise ApiError(405, "Method not allowed")
         except ApiError as exc:
@@ -638,13 +777,22 @@ class Handler(BaseHTTPRequestHandler):
             if "UNIQUE" in str(exc).upper():
                 message = "名称已存在"
             self.send_json({"error": message}, 409)
-        except Exception as exc:
-            self.send_json({"error": f"服务器错误: {exc}"}, 500)
+        except Exception:
+            traceback.print_exc()
+            self.send_json({"error": "服务器错误，请稍后再试"}, 500)
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length == 0:
             return {}
+        if length > MAX_JSON_BODY_SIZE:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            raise ApiError(413, "请求体过大")
         raw = self.rfile.read(length).decode("utf-8")
         try:
             value = json.loads(raw)
@@ -670,55 +818,184 @@ class Handler(BaseHTTPRequestHandler):
         return verify_session_token(self.cookie_value(AUTH_COOKIE))
 
     def send_auth_cookie(self, token: str) -> None:
+        secure = "; Secure" if is_secure_cookie_context() else ""
         self.send_header(
             "Set-Cookie",
-            f"{AUTH_COOKIE}={token}; Max-Age={SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax",
+            f"{AUTH_COOKIE}={token}; Max-Age={SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax{secure}",
         )
 
     def clear_auth_cookie(self) -> None:
+        secure = "; Secure" if is_secure_cookie_context() else ""
         self.send_header(
             "Set-Cookie",
-            f"{AUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
+            f"{AUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax{secure}",
         )
+
+    def accepts_gzip(self) -> bool:
+        accepted = self.headers.get("Accept-Encoding", "")
+        return any(item.strip().split(";", 1)[0].lower() == "gzip" for item in accepted.split(","))
+
+    def is_compressible_content(self, content_type: str) -> bool:
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        return media_type.startswith("text/") or media_type in {
+            "application/json",
+            "application/javascript",
+            "application/xml",
+            "image/svg+xml",
+        }
+
+    def send_connection_headers(self) -> None:
+        if self.close_connection:
+            self.send_header("Connection", "close")
+            return
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Keep-Alive", f"timeout={KEEP_ALIVE_TIMEOUT}")
+
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+    def send_body(
+        self,
+        content: bytes,
+        content_type: str,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        compress: bool = True,
+    ) -> None:
+        should_vary = compress and self.is_compressible_content(content_type)
+        encoded = content
+        if should_vary and len(content) >= GZIP_MIN_BODY_SIZE and self.accepts_gzip():
+            encoded = gzip.compress(content, compresslevel=6)
+            headers = {**(headers or {}), "Content-Encoding": "gzip"}
+
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_connection_headers()
+        self.send_security_headers()
+        if should_vary:
+            self.send_header("Vary", "Accept-Encoding")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def send_json(self, value, status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_body(body, "application/json; charset=utf-8", status)
 
     def send_download(self, content: bytes, content_type: str, filename: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_connection_headers()
+        self.send_security_headers()
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
 
-    def serve_static(self, path: str) -> None:
+    def static_asset_version(self, name: str) -> str:
+        file_path = STATIC_DIR / name
+        if not file_path.exists():
+            return "missing"
+        stat = file_path.stat()
+        return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+    def static_cache_headers(self, file_path: Path) -> tuple[str, str, float]:
+        stat = file_path.stat()
+        identities = [f"{stat.st_mtime_ns:x}-{stat.st_size:x}"]
+        modified_at = stat.st_mtime
+        if file_path.name == "index.html":
+            for name in VERSIONED_ASSETS:
+                asset_path = STATIC_DIR / name
+                if asset_path.exists():
+                    asset_stat = asset_path.stat()
+                    identities.append(f"{name}:{asset_stat.st_mtime_ns:x}-{asset_stat.st_size:x}")
+                    modified_at = max(modified_at, asset_stat.st_mtime)
+        etag = f'W/"{"-".join(identities)}"'
+        last_modified = formatdate(modified_at, usegmt=True)
+        return etag, last_modified, modified_at
+
+    def static_not_modified(self, etag: str, last_modified: str, modified_at: float) -> bool:
+        if self.headers.get("If-None-Match") == etag:
+            return True
+        if_modified_since = self.headers.get("If-Modified-Since")
+        if not if_modified_since:
+            return False
+        try:
+            since = parsedate_to_datetime(if_modified_since)
+        except (TypeError, ValueError):
+            return False
+        return since.timestamp() >= int(modified_at)
+
+    def static_cache_control(self, file_path: Path, query: str) -> str:
+        params = parse_qs(query)
+        if file_path.suffix in {".css", ".js"} and params.get("v"):
+            return "public, max-age=31536000, immutable"
+        if file_path.suffix in {".html", ".css", ".js"}:
+            return "no-cache"
+        return "public, max-age=3600"
+
+    def inject_asset_versions(self, file_path: Path, content: bytes) -> bytes:
+        if file_path.name != "index.html":
+            return content
+        html = content.decode("utf-8")
+        for name in VERSIONED_ASSETS:
+            version = self.static_asset_version(name)
+            pattern = rf"(/static/{re.escape(name)})(?:\?v=[^\"'<> ]*)?"
+            html = re.sub(pattern, rf"\1?v={version}", html)
+        return html.encode("utf-8")
+
+    def serve_static(self, path: str, query: str = "") -> None:
         if path in ("", "/"):
             file_path = STATIC_DIR / "index.html"
         else:
+            static_root = STATIC_DIR.resolve()
             relative_path = path.removeprefix("/static/").lstrip("/")
-            requested = (STATIC_DIR / relative_path).resolve()
-            if not str(requested).startswith(str(STATIC_DIR.resolve())):
+            requested = (static_root / relative_path).resolve()
+            try:
+                requested.relative_to(static_root)
+            except ValueError:
                 raise ApiError(403, "Forbidden")
             file_path = requested
 
         if not file_path.exists() or not file_path.is_file():
             file_path = STATIC_DIR / "index.html"
 
-        content = file_path.read_bytes()
+        etag, last_modified, modified_at = self.static_cache_headers(file_path)
         content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         if file_path.suffix in {".html", ".css", ".js"}:
             content_type += "; charset=utf-8"
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
+        cache_control = self.static_cache_control(file_path, query)
+        if self.static_not_modified(etag, last_modified, modified_at):
+            self.send_response(304)
+            self.send_connection_headers()
+            self.send_security_headers()
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
+            self.send_header("Cache-Control", cache_control)
+            if self.is_compressible_content(content_type):
+                self.send_header("Vary", "Accept-Encoding")
+            self.end_headers()
+            return
+
+        cached = _static_cache_get(file_path, etag)
+        if cached is not None:
+            content = cached
+        else:
+            content = self.inject_asset_versions(file_path, file_path.read_bytes())
+            _static_cache_set(file_path, etag, content)
+        self.send_body(
+            content,
+            content_type,
+            headers={
+                "ETag": etag,
+                "Last-Modified": last_modified,
+                "Cache-Control": cache_control,
+            },
+        )
 
     def handle_api(self, method: str, path: str, query: str = "") -> None:
         parts = [part for part in path.split("/") if part]
@@ -737,6 +1014,34 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if method == "GET" and parts == ["api", "bootstrap"]:
+            authenticated = self.is_authenticated()
+            payload = {
+                "authenticated": authenticated,
+                "configured": auth_configured(),
+                "env": ACCESS_KEY_ENV,
+            }
+            if authenticated:
+                params = parse_qs(query)
+                preferred_id = parse_optional_map_id((params.get("map_id") or [""])[0])
+                with connect() as conn:
+                    maps = load_maps(conn)
+                    selected_map = None
+                    if preferred_id is not None:
+                        selected_map = next((item for item in maps if item["id"] == preferred_id), None)
+                    if selected_map is None and maps:
+                        selected_map = maps[0]
+                    payload["maps"] = maps
+                    payload["selected_map_id"] = selected_map["id"] if selected_map else None
+                    if selected_map:
+                        payload["content"] = map_content_to_dict(
+                            conn, selected_map["id"], selected_map.get("counts")
+                        )
+                    else:
+                        payload["content"] = None
+            self.send_json(payload)
+            return
+
         if method == "POST" and parts == ["api", "login"]:
             data = self.read_json()
             access_key = get_access_key()
@@ -749,6 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_connection_headers()
             self.send_header("Content-Length", str(len(body)))
             self.send_auth_cookie(token)
             self.end_headers()
@@ -759,6 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_connection_headers()
             self.send_header("Content-Length", str(len(body)))
             self.clear_auth_cookie()
             self.end_headers()
@@ -786,8 +1093,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "GET" and parts == ["api", "maps"]:
             with connect() as conn:
-                rows = conn.execute("SELECT * FROM maps ORDER BY sort_order, id").fetchall()
-                self.send_json({"maps": [map_to_dict(conn, row) for row in rows]})
+                self.send_json({"maps": load_maps(conn)})
             return
 
         if method == "POST" and parts == ["api", "maps"]:
@@ -803,7 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"map": map_to_dict(conn, row)}, 201)
             return
 
-        map_match = re.fullmatch(r"/api/maps/(\d+)", path)
+        map_match = _RE_MAP.match(path)
         if map_match and method == "PUT":
             map_id = int(map_match.group(1))
             data = self.read_json()
@@ -825,35 +1131,41 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             return
 
-        content_match = re.fullmatch(r"/api/maps/(\d+)/content", path)
+        if method == "PUT" and parts == ["api", "maps", "reorder"]:
+            data = self.read_json()
+            order = data.get("order")
+            if not isinstance(order, list) or not order:
+                raise ApiError(400, "请提供有序的地图 ID 列表")
+            parsed_order: list[int] = []
+            seen_ids: set[int] = set()
+            for raw_id in order:
+                map_id = parse_map_id(raw_id)
+                if map_id in seen_ids:
+                    raise ApiError(400, "地图 ID 不能重复")
+                seen_ids.add(map_id)
+                parsed_order.append(map_id)
+            with connect() as conn:
+                existing_ids = {
+                    row["id"] for row in conn.execute("SELECT id FROM maps")
+                }
+                if set(parsed_order) != existing_ids:
+                    raise ApiError(400, "请提供完整且有效的地图 ID 列表")
+                stamp = now()
+                for index, map_id in enumerate(parsed_order):
+                    conn.execute("UPDATE maps SET sort_order = ?, updated_at = ? WHERE id = ?", (index + 1, stamp, map_id))
+                self.send_json({"maps": load_maps(conn)})
+            return
+
+        content_match = _RE_MAP_CONTENT.match(path)
         if content_match and method == "GET":
             map_id = int(content_match.group(1))
             with connect() as conn:
-                row = require_map(conn, map_id)
-                tactics = conn.execute(
-                    "SELECT * FROM tactics WHERE map_id = ? ORDER BY updated_at DESC, id DESC", (map_id,)
-                ).fetchall()
-                notes = conn.execute(
-                    "SELECT * FROM notes WHERE map_id = ? ORDER BY sort_order, id", (map_id,)
-                ).fetchall()
-                self.send_json(
-                    {
-                        "map": map_to_dict(conn, row),
-                        "tactics": {
-                            "T": [tactic_to_dict(item) for item in tactics if item["side"] == "T"],
-                            "CT": [tactic_to_dict(item) for item in tactics if item["side"] == "CT"],
-                        },
-                        "notes": {
-                            "T": [note_to_dict(item) for item in notes if item["side"] == "T"],
-                            "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
-                        },
-                    }
-                )
+                self.send_json(map_content_to_dict(conn, map_id))
             return
 
         if method == "POST" and parts == ["api", "tactics"]:
             data = self.read_json()
-            map_id = int(data.get("map_id", 0) or 0)
+            map_id = parse_map_id(data.get("map_id"))
             side = validate_side(data.get("side"))
             payload = validate_tactic_payload(data)
             stamp = now()
@@ -884,7 +1196,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"tactic": tactic_to_dict(row)}, 201)
             return
 
-        tactic_match = re.fullmatch(r"/api/tactics/(\d+)", path)
+        tactic_match = _RE_TACTIC.match(path)
         if tactic_match and method == "PUT":
             tactic_id = int(tactic_match.group(1))
             data = self.read_json()
@@ -924,7 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "POST" and parts == ["api", "notes"]:
             data = self.read_json()
-            map_id = int(data.get("map_id", 0) or 0)
+            map_id = parse_map_id(data.get("map_id"))
             side = validate_side(data.get("side"))
             body = str(data.get("body", "")).strip()
             if not body:
@@ -947,7 +1259,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"note": note_to_dict(row)}, 201)
             return
 
-        note_match = re.fullmatch(r"/api/notes/(\d+)", path)
+        note_match = _RE_NOTE.match(path)
         if note_match and method == "PUT":
             note_id = int(note_match.group(1))
             data = self.read_json()
@@ -972,6 +1284,29 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "API 不存在")
 
 
+_static_cache_lock = threading.Lock()
+_static_cache: dict[str, tuple[str, bytes]] = {}
+
+
+def _static_cache_get(file_path: Path, etag: str) -> bytes | None:
+    key = str(file_path)
+    with _static_cache_lock:
+        entry = _static_cache.get(key)
+        if entry and entry[0] == etag:
+            return entry[1]
+    return None
+
+
+def _static_cache_set(file_path: Path, etag: str, content: bytes) -> None:
+    key = str(file_path)
+    with _static_cache_lock:
+        _static_cache[key] = (etag, content)
+
+
+class TacticsHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
 def find_port(start: int) -> int:
     for port in range(start, start + 20):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -987,7 +1322,15 @@ def run() -> None:
     preferred = int(env_port or "8000")
     port = preferred if env_port else find_port(preferred)
     host = os.environ.get("HOST") or ("0.0.0.0" if env_port else "127.0.0.1")
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = TacticsHTTPServer((host, port), Handler)
+
+    def graceful_shutdown(signum, frame):
+        print("收到关闭信号，正在停止服务...", flush=True)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     print(f"CS2 战术本已启动: http://{display_host}:{port}", flush=True)
     if not os.environ.get(ACCESS_KEY_ENV) and not env_port:

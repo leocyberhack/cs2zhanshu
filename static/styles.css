@@ -267,6 +267,16 @@ button:disabled {
   box-shadow: 0 12px 24px rgba(31, 143, 116, 0.15);
 }
 
+.map-item.dragging {
+  opacity: 0.4;
+}
+
+.map-item.drag-over {
+  border-color: var(--orange);
+  box-shadow: 0 0 0 2px rgba(223, 106, 63, 0.3);
+  transform: scale(1.02);
+}
+
 .map-title-row {
   display: flex;
   justify-content: space-between;
@@ -789,6 +799,27 @@ button:disabled {
   margin-top: 16px;
 }
 
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 20px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-state svg {
+  opacity: 0.35;
+}
+
+.empty-state p {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
 .toast {
   position: fixed;
   right: 18px;
@@ -801,6 +832,17 @@ button:disabled {
   color: #fff;
   box-shadow: var(--shadow);
   font-weight: 800;
+  transform: translateY(0);
+  opacity: 1;
+  transition: transform 300ms ease, opacity 300ms ease;
+}
+
+.toast.hidden {
+  display: block !important;
+  transform: translateY(16px);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
 }
 
 .toast.error {

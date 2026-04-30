@@ -6,6 +6,8 @@ venv/
 env/
 
 tactics.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 

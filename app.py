@@ -335,10 +335,10 @@ def build_export_blocks() -> list[dict]:
                 "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
             }
             blocks.append({"text": map_row["name"], "level": 0, "kind": "heading1", "page_break": map_index > 0})
-            add_tactic_blocks(blocks, "T 方战术", tactics_by_side["T"])
-            add_tactic_blocks(blocks, "CT 方战术", tactics_by_side["CT"])
-            add_note_blocks(blocks, "T 方注意事项和技巧", notes_by_side["T"])
-            add_note_blocks(blocks, "CT 方注意事项和技巧", notes_by_side["CT"])
+            add_tactic_blocks(blocks, "T方战术", tactics_by_side["T"])
+            add_tactic_blocks(blocks, "CT方战术", tactics_by_side["CT"])
+            add_note_blocks(blocks, "T方注意事项和技巧", notes_by_side["T"])
+            add_note_blocks(blocks, "CT方注意事项和技巧", notes_by_side["CT"])
         return blocks
 
 

@@ -321,7 +321,7 @@ def build_export_blocks() -> list[dict]:
             {"text": "CS2 战术本导出", "level": 0, "kind": "title"},
             {"text": f"导出时间：{now()}", "level": 0, "kind": "meta"},
         ]
-        for map_row in maps:
+        for map_index, map_row in enumerate(maps):
             map_id = map_row["id"]
             tactics = conn.execute(
                 "SELECT * FROM tactics WHERE map_id = ? ORDER BY side, updated_at DESC, id DESC", (map_id,)
@@ -337,7 +337,7 @@ def build_export_blocks() -> list[dict]:
                 "T": [note_to_dict(item) for item in notes if item["side"] == "T"],
                 "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
             }
-            blocks.append({"text": map_row["name"], "level": 0, "kind": "heading1"})
+            blocks.append({"text": map_row["name"], "level": 0, "kind": "heading1", "page_break": map_index > 0})
             add_tactic_blocks(blocks, "T 方战术", tactics_by_side["T"])
             add_tactic_blocks(blocks, "CT 方战术", tactics_by_side["CT"])
             add_note_blocks(blocks, "T 方注意事项和技巧", notes_by_side["T"])
@@ -345,7 +345,7 @@ def build_export_blocks() -> list[dict]:
         return blocks
 
 
-def docx_paragraph(text: str, kind: str, level: int) -> str:
+def docx_paragraph(text: str, kind: str, level: int, page_break: bool = False) -> str:
     size_map = {"title": 36, "heading1": 30, "heading2": 24, "heading3": 21, "label": 20, "meta": 18}
     size = size_map.get(kind, 19)
     bold = kind in {"title", "heading1", "heading2", "heading3", "label"}
@@ -354,10 +354,12 @@ def docx_paragraph(text: str, kind: str, level: int) -> str:
     indent = max(0, level) * 360
     bold_xml = "<w:b/>" if bold else ""
     color = "66756E" if kind in {"meta", "muted"} else "18211D"
+    break_xml = "<w:r><w:br w:type=\"page\"/></w:r>" if page_break else ""
     return (
         "<w:p>"
         f"<w:pPr><w:spacing w:before=\"{spacing_before}\" w:after=\"{spacing_after}\"/>"
         f"<w:ind w:left=\"{indent}\"/></w:pPr>"
+        f"{break_xml}"
         "<w:r>"
         f"<w:rPr>{bold_xml}<w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/></w:rPr>"
         f"<w:t xml:space=\"preserve\">{xml_escape(text)}</w:t>"
@@ -366,7 +368,9 @@ def docx_paragraph(text: str, kind: str, level: int) -> str:
 
 
 def build_docx(blocks: list[dict]) -> bytes:
-    paragraphs = "\n".join(docx_paragraph(item["text"], item["kind"], item["level"]) for item in blocks)
+    paragraphs = "\n".join(
+        docx_paragraph(item["text"], item["kind"], item["level"], item.get("page_break", False)) for item in blocks
+    )
     document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -438,6 +442,8 @@ def build_pdf(blocks: list[dict]) -> bytes:
 
     for block in blocks:
         kind = block["kind"]
+        if block.get("page_break"):
+            new_page()
         level = block["level"]
         size = size_map.get(kind, 10)
         leading = size + 6

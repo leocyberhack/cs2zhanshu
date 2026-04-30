@@ -869,6 +869,14 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(KEEP_ALIVE_TIMEOUT)
 
+    def handle(self) -> None:
+        """Override to silence keep-alive timeout logs (expected idle disconnects)."""
+        try:
+            super().handle()
+        except (TimeoutError, OSError):
+            # Normal: keep-alive connection idled past KEEP_ALIVE_TIMEOUT
+            pass
+
     def log_message(self, format: str, *args) -> None:
         print("[%s] %s" % (self.log_date_time_string(), format % args))
 
@@ -1013,7 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, value, status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self.send_body(body, "application/json; charset=utf-8", status)
+        self.send_body(body, "application/json; charset=utf-8", status, headers={"Cache-Control": "no-store"})
 
     def send_download(self, content: bytes, content_type: str, filename: str) -> None:
         self.send_response(200)

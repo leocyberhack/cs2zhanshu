@@ -184,6 +184,37 @@ async function logout() {
   showLogin("已退出登录");
 }
 
+function filenameFromDisposition(disposition, fallback) {
+  const match = /filename="?([^"]+)"?/i.exec(disposition || "");
+  return match ? match[1] : fallback;
+}
+
+async function downloadExport(format) {
+  const response = await fetch(`/api/export?format=${encodeURIComponent(format)}`, {
+    credentials: "same-origin",
+  });
+  if (!response.ok) {
+    let message = "下载失败";
+    try {
+      const data = await response.json();
+      message = data.error || message;
+    } catch {}
+    if (response.status === 401) showLogin(message);
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const fallback = format === "pdf" ? "cs2-tactics-book.pdf" : "cs2-tactics-book.docx";
+  const filename = filenameFromDisposition(response.headers.get("Content-Disposition"), fallback);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 async function loadMaps(preferredId = state.selectedMapId) {
   const data = await api("/api/maps");
   state.maps = data.maps || [];
@@ -774,6 +805,12 @@ document.addEventListener("click", async (event) => {
   try {
     if (action === "logout") {
       await logout();
+      return;
+    }
+
+    if (action === "download-export") {
+      await downloadExport(target.dataset.format || "docx");
+      toast("导出已开始");
       return;
     }
 

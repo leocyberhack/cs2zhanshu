@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
@@ -11,10 +12,12 @@ import secrets
 import socket
 import sqlite3
 import time
+import zipfile
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -248,6 +251,256 @@ def map_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
+def tactic_display_meta(tactic: dict) -> tuple[str, str]:
+    economy = tactic["economy_custom"] if tactic["economy"] == "自定义" else tactic["economy"]
+    tags = [tag for tag in tactic.get("tactic_tags", []) if tag != "自定义"]
+    tags.extend(tactic.get("tactic_custom_tags", []))
+    return economy or "通用", "、".join(tags) if tags else "未标记"
+
+
+def grouped_commands(commands: list[dict]) -> dict[int, list[str]]:
+    grouped: dict[int, list[str]] = {}
+    for command in commands:
+        priority = max(1, int(command.get("priority", 1)))
+        grouped.setdefault(priority, []).append(command.get("text", ""))
+    return grouped
+
+
+def add_decision_blocks(blocks: list[dict], nodes: list[dict], level: int) -> None:
+    if not nodes:
+        blocks.append({"text": "暂无中期判断", "level": level, "kind": "muted"})
+        return
+    for index, node in enumerate(nodes, start=1):
+        condition = node.get("condition") or "未填写条件"
+        then_action = node.get("thenAction") or "未填写行动"
+        blocks.append({"text": f"{index}. 如果：{condition}", "level": level, "kind": "body"})
+        blocks.append({"text": f"那么：{then_action}", "level": level + 1, "kind": "body"})
+        children = node.get("children", [])
+        if children:
+            blocks.append({"text": "下级判断", "level": level + 1, "kind": "label"})
+            add_decision_blocks(blocks, children, level + 2)
+
+
+def add_tactic_blocks(blocks: list[dict], title: str, tactics: list[dict]) -> None:
+    blocks.append({"text": title, "level": 1, "kind": "heading2"})
+    if not tactics:
+        blocks.append({"text": "暂无战术", "level": 2, "kind": "muted"})
+        return
+    for index, tactic in enumerate(tactics, start=1):
+        economy, tags = tactic_display_meta(tactic)
+        blocks.append({"text": f"{index}. {tactic['title']}", "level": 2, "kind": "heading3"})
+        blocks.append({"text": f"经济属性：{economy}", "level": 3, "kind": "meta"})
+        blocks.append({"text": f"战术属性：{tags}", "level": 3, "kind": "meta"})
+        blocks.append({"text": "前期战术展开", "level": 3, "kind": "label"})
+        commands = grouped_commands(tactic.get("early_commands", []))
+        if commands:
+            for priority in sorted(commands):
+                blocks.append({"text": f"P{priority} 同步执行", "level": 4, "kind": "label"})
+                for text in commands[priority]:
+                    blocks.append({"text": f"- {text}", "level": 5, "kind": "body"})
+        else:
+            blocks.append({"text": "暂无前期命令", "level": 4, "kind": "muted"})
+        blocks.append({"text": "中期决策", "level": 3, "kind": "label"})
+        add_decision_blocks(blocks, tactic.get("decision_tree", []), 4)
+
+
+def add_note_blocks(blocks: list[dict], title: str, notes: list[dict]) -> None:
+    blocks.append({"text": title, "level": 1, "kind": "heading2"})
+    if not notes:
+        blocks.append({"text": "暂无内容", "level": 2, "kind": "muted"})
+        return
+    for index, note in enumerate(notes, start=1):
+        body = " ".join(note["body"].splitlines()).strip()
+        blocks.append({"text": f"{index}. {body}", "level": 2, "kind": "body"})
+
+
+def build_export_blocks() -> list[dict]:
+    with connect() as conn:
+        maps = conn.execute("SELECT * FROM maps ORDER BY sort_order, id").fetchall()
+        blocks = [
+            {"text": "CS2 战术本导出", "level": 0, "kind": "title"},
+            {"text": f"导出时间：{now()}", "level": 0, "kind": "meta"},
+        ]
+        for map_row in maps:
+            map_id = map_row["id"]
+            tactics = conn.execute(
+                "SELECT * FROM tactics WHERE map_id = ? ORDER BY side, updated_at DESC, id DESC", (map_id,)
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT * FROM notes WHERE map_id = ? ORDER BY side, sort_order, id", (map_id,)
+            ).fetchall()
+            tactics_by_side = {
+                "T": [tactic_to_dict(item) for item in tactics if item["side"] == "T"],
+                "CT": [tactic_to_dict(item) for item in tactics if item["side"] == "CT"],
+            }
+            notes_by_side = {
+                "T": [note_to_dict(item) for item in notes if item["side"] == "T"],
+                "CT": [note_to_dict(item) for item in notes if item["side"] == "CT"],
+            }
+            blocks.append({"text": map_row["name"], "level": 0, "kind": "heading1"})
+            add_tactic_blocks(blocks, "T 方战术", tactics_by_side["T"])
+            add_tactic_blocks(blocks, "CT 方战术", tactics_by_side["CT"])
+            add_note_blocks(blocks, "T 方注意事项和技巧", notes_by_side["T"])
+            add_note_blocks(blocks, "CT 方注意事项和技巧", notes_by_side["CT"])
+        return blocks
+
+
+def docx_paragraph(text: str, kind: str, level: int) -> str:
+    size_map = {"title": 36, "heading1": 30, "heading2": 24, "heading3": 21, "label": 20, "meta": 18}
+    size = size_map.get(kind, 19)
+    bold = kind in {"title", "heading1", "heading2", "heading3", "label"}
+    spacing_before = 220 if kind in {"heading1", "heading2"} else 70
+    spacing_after = 90 if kind in {"title", "heading1", "heading2"} else 40
+    indent = max(0, level) * 360
+    bold_xml = "<w:b/>" if bold else ""
+    color = "66756E" if kind in {"meta", "muted"} else "18211D"
+    return (
+        "<w:p>"
+        f"<w:pPr><w:spacing w:before=\"{spacing_before}\" w:after=\"{spacing_after}\"/>"
+        f"<w:ind w:left=\"{indent}\"/></w:pPr>"
+        "<w:r>"
+        f"<w:rPr>{bold_xml}<w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/></w:rPr>"
+        f"<w:t xml:space=\"preserve\">{xml_escape(text)}</w:t>"
+        "</w:r></w:p>"
+    )
+
+
+def build_docx(blocks: list[dict]) -> bytes:
+    paragraphs = "\n".join(docx_paragraph(item["text"], item["kind"], item["level"]) for item in blocks)
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {paragraphs}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>"""
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("word/document.xml", document_xml)
+    return output.getvalue()
+
+
+def pdf_units(text: str) -> float:
+    return sum(1.0 if ord(char) > 127 else 0.55 for char in text)
+
+
+def wrap_pdf_text(text: str, max_units: float) -> list[str]:
+    if not text:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        candidate = current + char
+        if current and pdf_units(candidate) > max_units:
+            lines.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def pdf_text_command(text: str, x: int, y: int, size: int) -> str:
+    hex_text = text.encode("utf-16-be").hex().upper()
+    return f"BT /F1 {size} Tf 1 0 0 1 {x} {y} Tm <{hex_text}> Tj ET\n"
+
+
+def build_pdf(blocks: list[dict]) -> bytes:
+    page_width, page_height = 595, 842
+    margin_x, margin_y = 48, 50
+    y = page_height - margin_y
+    pages: list[str] = []
+    current = ""
+    size_map = {"title": 18, "heading1": 16, "heading2": 13, "heading3": 12, "label": 11, "meta": 10}
+
+    def new_page() -> None:
+        nonlocal current, y
+        if current:
+            pages.append(current)
+        current = ""
+        y = page_height - margin_y
+
+    for block in blocks:
+        kind = block["kind"]
+        level = block["level"]
+        size = size_map.get(kind, 10)
+        leading = size + 6
+        if kind in {"title", "heading1"}:
+            y -= 8
+        x = margin_x + level * 18
+        max_units = max(18, (page_width - x - margin_x) / max(size * 0.58, 1))
+        for line in wrap_pdf_text(block["text"], max_units):
+            if y < margin_y:
+                new_page()
+            current += pdf_text_command(line, x, y, size)
+            y -= leading
+        if kind in {"title", "heading1", "heading2"}:
+            y -= 4
+    if current:
+        pages.append(current)
+
+    objects: list[bytes | None] = [None]
+    objects.append(b"")
+    objects.append(b"")
+    font_object = (
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H "
+        b"/DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light "
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> "
+        b"/FontDescriptor << /Type /FontDescriptor /FontName /STSong-Light /Flags 6 "
+        b"/FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 880 /Descent -120 "
+        b"/CapHeight 880 /StemV 80 >> >>] >>"
+    )
+    objects.append(font_object)
+    page_object_ids: list[int] = []
+    for page in pages or [""]:
+        stream = page.encode("ascii")
+        content_obj_id = len(objects)
+        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
+        page_obj_id = len(objects)
+        page_object_ids.append(page_obj_id)
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_obj_id} 0 R >>".encode("ascii")
+        )
+    kids = " ".join(f"{item} 0 R" for item in page_object_ids)
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_ids)} >>".encode("ascii")
+
+    output = io.BytesIO()
+    output.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for object_id, body in enumerate(objects[1:], start=1):
+        offsets.append(output.tell())
+        output.write(f"{object_id} 0 obj\n".encode("ascii"))
+        output.write(body or b"")
+        output.write(b"\nendobj\n")
+    xref_offset = output.tell()
+    output.write(f"xref\n0 {len(objects)}\n".encode("ascii"))
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.write(
+        f"trailer\n<< /Size {len(objects)} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode("ascii")
+    )
+    return output.getvalue()
+
+
 class ApiError(Exception):
     def __init__(self, status: int, message: str):
         self.status = status
@@ -358,7 +611,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
             if path.startswith("/api/"):
-                self.handle_api(method, path)
+                self.handle_api(method, path, parsed.query)
             elif method == "GET":
                 self.serve_static(path)
             else:
@@ -421,6 +674,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_download(self, content: bytes, content_type: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
     def serve_static(self, path: str) -> None:
         if path in ("", "/"):
             file_path = STATIC_DIR / "index.html"
@@ -444,7 +705,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def handle_api(self, method: str, path: str) -> None:
+    def handle_api(self, method: str, path: str, query: str = "") -> None:
         parts = [part for part in path.split("/") if part]
 
         if method == "GET" and parts == ["api", "health"]:
@@ -491,6 +752,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authenticated():
             raise ApiError(401, "请先输入密钥登录")
+
+        if method == "GET" and parts == ["api", "export"]:
+            params = parse_qs(query)
+            export_format = (params.get("format", ["docx"])[0] or "docx").lower()
+            blocks = build_export_blocks()
+            if export_format == "docx":
+                self.send_download(
+                    build_docx(blocks),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "cs2-tactics-book.docx",
+                )
+                return
+            if export_format == "pdf":
+                self.send_download(build_pdf(blocks), "application/pdf", "cs2-tactics-book.pdf")
+                return
+            raise ApiError(400, "导出格式必须是 docx 或 pdf")
 
         if method == "GET" and parts == ["api", "maps"]:
             with connect() as conn:

@@ -70,3 +70,12 @@ DB_PATH=/data/tactics.db
 ```text
 GET /api/health
 ```
+
+登录后可以在主界面下载结构化战术本：
+
+```text
+GET /api/export?format=docx
+GET /api/export?format=pdf
+```
+
+导出内容按地图分组，每张地图包含 T 方战术、CT 方战术、T 方注意事项和技巧、CT 方注意事项和技巧。

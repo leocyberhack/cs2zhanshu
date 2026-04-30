@@ -347,7 +347,7 @@ def docx_paragraph(text: str, kind: str, level: int, page_break: bool = False) -
     size = size_map.get(kind, 19)
     bold = kind in {"heading1", "heading2", "heading3", "label"}
     italic = kind == "heading1"
-    centered = kind in {"heading1", "heading2"}
+    centered = kind == "heading1"
     spacing_before = 40
     spacing_after = 40
     indent = 0 if centered else max(0, level) * 360
@@ -456,7 +456,7 @@ def build_pdf(blocks: list[dict]) -> bytes:
             new_page()
         level = block["level"]
         size = size_map.get(kind, 10)
-        centered = kind in {"heading1", "heading2"}
+        centered = kind == "heading1"
         bold = kind in {"heading1", "heading2", "heading3", "label"}
         italic = kind == "heading1"
         x = margin_x + level * 18
